@@ -146,7 +146,7 @@ with log_path.open(mode='xt', encoding='utf_8', newline='\n') as log_file, dump_
 	max_pages = 1
 	missing_count = 0
 	
-	log(f'Grabbing all {args.type} comments starting from {args.start_id} until {args.end_id or str(args.args.end_count) + " misses"}')
+	log(f'Grabbing all {args.type} comments starting from {args.start_id} until {args.end_id or str(args.end_count) + " misses"}')
 	
 	while True:
 		if args.end_id is not None and current_id >= args.end_id:
