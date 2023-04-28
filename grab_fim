@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+
+import sys
+import argparse
+import json
+import requests
+
+from pathlib import Path
+
+from time import sleep
+from random import uniform
+from urllib.error import HTTPError
+from requests.exceptions import JSONDecodeError
+
+class RetryExhausted(Exception):
+	pass
+
+class NotFound(Exception):
+	pass
+
+class APIError(Exception):
+	pass
+
+class MissingKeys(Exception):
+	pass
+
+user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Safari/537.36'
+
+endpoints = {
+	'story': lambda id, page: f"https://www.fimfiction.net/ajax/comments/story_comments?item_id={id}&page={page}&order=DESC",
+	'blog': lambda id, page: f"https://www.fimfiction.net/ajax/comments/comments_user_page?item_id={id}&page={page}&order=DESC",
+	'user': lambda id, page: f"https://www.fimfiction.net/ajax/comments/blog_posts_comments?item_id={id}&page={page}&order=DESC",
+	'group': lambda id, page: f"https://www.fimfiction.net/ajax/comments/comments_group?item_id={id}&page={page}&order=DESC",
+}
+
+
+# setup
+parser = argparse.ArgumentParser(
+	prog='Fimfiction.net comment scraper',
+	description='Downloads comments from fimfiction.net and scans them for possible imgur links'
+)
+
+parser.add_argument('type', choices=list(endpoints.keys()), help='What kind of comments to scrape')
+parser.add_argument('-f', '--force', action='store_true', help='Overwrite already existing files')
+parser.add_argument('--tries', type=int, default=10, help='How often a request should be made before marking it as failed')
+parser.add_argument('--start-id', type=int, default=1, help='What id to start with, inclusive')
+parser.add_argument('--end-id', type=int, help='What id to end on, exclusive')
+parser.add_argument('--end-count', type=int, default=512, help='The count of consecutive 404 responses after which the program should terminate. Only used if --end-id is not specified') 
+parser.add_argument('--delay', default='1-2', help='The delay in seconds between requests. Use "MIN-MAX" to specify a range to randomly pick from')
+parser.add_argument('--quiet', action='store_true', help='Do not write status messages to the log file. INFO, WARN and ERR messages are unaffected')
+
+args = parser.parse_args()
+
+log_path  = Path(f"./fimfiction_{args.type}_{args.start_id}{args.end_id and '-' + str(args.end_id) or '' }.log")
+dump_path = Path(f"./fimfiction_{args.type}_{args.start_id}{args.end_id and '-' + str(args.end_id) or '' }_comments.dump")
+
+def eprint(*args, **kwargs):
+	print(*args, file=sys.stderr, **kwargs, flush=True)
+
+if log_path.exists():
+	if args.force:
+		eprint(f'INFO: Found existing log file "{log_path}", deleting')
+		log_path.unlink()
+	else:
+		eprint(f'ERR: File "{log_path}" already exists')
+		raise SystemExit(1)
+	
+if dump_path.exists():
+	if args.force:
+		eprint(f'INFO: Found existing dump file "{dump_path}", deleting')
+		dump_path.unlink()
+	else:
+		eprint(f'ERR: File "{dump_path}" already exists')
+		raise SystemExit(1)
+
+delay_min = 0
+delay_max = 0
+
+if "-" in args.delay:
+	delay_min, delay_max = list(int(s) for s in args.delay.split("-", 1))
+else:
+	delay_min, delay_max = int(args.delay)
+
+
+
+# the actual scraper
+
+def delay():
+	sleep(uniform(delay_min, delay_max))
+
+def get_page(id, page, max_pages):
+	message=f'>>Get id: {id} ({page}/{max_pages})'
+	if args.quiet:
+		eprint(message)
+	else:
+		log(message)
+	error_count = 0
+	while True:
+		error_count += 1
+		try:
+			response = requests.get(endpoints[args.type](id, page), headers={'user-agent': user_agent})
+			response.raise_for_status()
+			json = response.json()
+			
+			if "error" in json:
+				raise NotFound()
+			if not all(k in json for k in ["content", "num_pages"]):
+				raise MissingKeys("Did not find required keys")
+			
+			return json
+		except NotFound:
+			raise
+		except (JSONDecodeError, MissingKeys) as err:
+			log(f'ERR {str(id)}: Invalid JSON response "{str(err)}", skipping')
+			raise RetryExhausted()
+		except HTTPError as err:
+			if err.code == 404:
+				raise NotFound()
+			if err.code == 400:
+				log(f'ERR {str(id)}: HTTP error {err.code}, skipping')
+				raise RetryExhausted()
+			if err.code == 429:
+				wait_time = uniform(max(delay_max*2, 5))
+				log(f"WARN {str(id)}: Rate limit, waiting {wait_time} seconds")
+				sleep(wait_time)
+				continue
+			log(f'WARN {str(id)}: HTTP error "{str(err)}", retrying ({error_count}/{args.tries})')
+		except Exception as err:
+			log(f'WARN {str(id)}: Unkown error "{str(err)}", retrying ({error_count}/{args.tries})')
+
+		if error_count >= args.tries:
+			log(f"ERR {str(id)}: Exhausted retries, skipping")
+			raise RetryExhausted()
+		
+		delay()
+
+with log_path.open(mode='xt', encoding='utf_8', newline='\n') as log_file, dump_path.open(mode='xt', encoding='utf_8', newline='\n') as dump_file:
+	
+	def log(*args, **kwargs):
+		print(*args, file=log_file, **kwargs)
+		eprint(*args, **kwargs)
+		pass
+	
+	current_id = args.start_id
+	current_page = 1
+	max_pages = 1
+	missing_count = 0
+	
+	log(f'Grabbing all {args.type} comments starting from {args.start_id} until {args.end_id or str(args.args.end_count) + " misses"}')
+	
+	while True:
+		if args.end_id is not None and current_id >= args.end_id:
+			log(f'INFO: Reached end id {args.end_id}. Terminating')
+			raise SystemExit(0)
+	
+		reply = None
+		try:
+			reply = get_page(current_id, current_page, max_pages)
+		except (RetryExhausted, NotFound) as err:
+			if isinstance(err, NotFound):
+				missing_count += 1
+				if args.quiet:
+					log(f'INFO: {current_id} not found ({missing_count}/{args.end_count})')
+				else:
+					log(f'INFO: Not found ({missing_count}/{args.end_count})')
+
+				if args.end_id is None:
+					if missing_count >= args.end_count:
+						log(f'INFO: Encountered {missing_count} consecutive misses. Terminating')
+						raise SystemExit(0)
+
+			current_id += 1
+			current_page = 1
+			max_pages = 1
+			
+			delay()
+			continue
+
+		missing_count = 0
+
+		
+		if "imgur" in reply["content"]:
+			out = {
+				"type": args.type,
+				"id": current_id,
+				"page": current_page,
+				"content": reply["content"]
+			}
+
+			json.dump(out, dump_file)
+			print('\n', file=dump_file, end="")
+
+
+		max_pages = int(reply["num_pages"])
+
+		if current_page >= max_pages:
+			current_id += 1
+			current_page = 0
+			max_pages = 1
+
+		current_page += 1
+		delay()
